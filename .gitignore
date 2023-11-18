@@ -1,0 +1,16 @@
+# List of files that needs to be ignored in git
+
+# Env files
+/.env
+
+# Python cache
+/open_ai_assistant/__pycache__
+
+# Assistant.json file with assistant id
+/open_ai_assistant/assistant.json
+
+# Learning base containment
+/open_ai_assistant/Learning_base/*
+
+# Ignore DS store file
+/.DS_store
