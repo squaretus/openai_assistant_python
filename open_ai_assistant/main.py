@@ -1,80 +1,129 @@
-import os
-from time import sleep
-from packaging import version
-from flask import Flask, request, jsonify
-import openai
-from openai import OpenAI
-import functions
+# import os
+import psycopg2
+import pandas as pd
+# from langchain import hub
+# from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.schema import Document
+from langchain_ollama import OllamaEmbeddings
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 
-# Check OpenAI version is correct
-required_version = version.parse("1.1.1")
-current_version = version.parse(openai.__version__)
-OPENAI_API_KEY = os.environ['OPENAI_API_KEY']
+from langchain_ollama.chat_models import ChatOllama
 
-if current_version < required_version:
-  raise ValueError(f"Error: OpenAI version {openai.__version__}"
-                   " is less than the required version 1.1.1")
-else:
-  print("OpenAI version is compatible.")
+from uuid import uuid4
 
-# Start Flask app
-app = Flask(__name__)
+from langchain_chroma import Chroma
 
-# Init client
-client = OpenAI(api_key=OPENAI_API_KEY)  # should use env variable OPENAI_API_KEY in secrets (bottom left corner)
+from langchain_community.document_loaders import PyPDFLoader
 
-# Create new assistant or load existing
-assistant_id = functions.create_assistant(client)
+data_dir = "/app/open_ai_assistant/learning_base"
 
-# Start conversation thread
-@app.route('/start', methods=['GET'])
+# Подключение к PostgreSQL
+db_conn = psycopg2.connect(
+    dbname='api_prod',
+    user='karo_user',
+    password='1',
+    host='db',
+    port='5432'
+)
 
-def start_conversation():
-  print("Starting a new conversation...")  # Debugging line
-  thread = client.beta.threads.create()
-  print(f"New thread created with ID: {thread.id}")  # Debugging line
-  return jsonify({"thread_id": thread.id})
+# Запрос для получения фильмов и сеансов на текущий день
+def fetch_today_sessions():
+    query = """SELECT s.started_at::text AS \"Дата и время начала сеанса\",
+                      f.title AS \"Название фильма\",
+                      f.actors AS \"Актеры в фильме\",
+                      c.name AS \"Название кинотеатра\",
+                      ct.name AS \"Название города кинотеатра\"
+               FROM sessions AS s
+               LEFT JOIN films AS f ON s.film_id = f.id
+               LEFT JOIN cinemas AS c ON s.cinema_id = c.id
+               LEFT JOIN cities AS ct ON s.city_id = ct.id
+               WHERE s.started_at >= CURRENT_TIMESTAMP
+               ORDER BY s.started_at ASC
+               LIMIT 10"""
 
-# Generate response
-@app.route('/chat', methods=['POST'])
+    # Загружаем результат запроса в DataFrame
+    df = pd.read_sql(query, db_conn)
 
-def chat():
-  data = request.json
-  thread_id = data.get('thread_id')
-  user_input = data.get('message', '')
+    df = df.fillna("Пусто")
 
-  if not thread_id:
-    print("Error: Missing thread_id")  # Debugging line
-    return jsonify({"error": "Missing thread_id"}), 400
+    # Преобразуем DataFrame в список словарей
+    return df.to_dict(orient='records')
 
-  print(f"Received message: {user_input} for thread ID: {thread_id}"
-        )  # Debugging line
+sessions = fetch_today_sessions()
 
-  # Add the user's message to the thread
-  client.beta.threads.messages.create(thread_id=thread_id,
-                                      role="user",
-                                      content=user_input)
+# files = []
 
-  # Run the Assistant
-  run = client.beta.threads.runs.create(thread_id=thread_id,
-                                        assistant_id=assistant_id)
+# prompt = hub.pull("rlm/rag-prompt")
 
-  # Check if the Run requires action (function call)
-  while True:
-    run_status = client.beta.threads.runs.retrieve(thread_id=thread_id,
-                                                   run_id=run.id)
-    print(f"Run status: {run_status.status}")
-    if run_status.status == 'completed':
-      break
-    sleep(1)  # Wait for a second before checking again
+instructions = (
+    "Ты виртуальный киноэксперт. Ты должен отвечать на вопросы пользователей "
+    "только исходя из контекста, представленного в запросе. Не используй информацию "
+    " из сторонних источников и отвечай на вопросы, связанные только с сеансами, "
+    "просмотром кино, вопросы о фильмах и актерах."
+)
 
-  # Retrieve and return the latest message from the assistant
-  messages = client.beta.threads.messages.list(thread_id=thread_id)
-  response = messages.data[0].content[0].text.value
+prompt = PromptTemplate.from_template(
+    "instructions: {instructions}\n\ncontext: {context}\n\nquestion: {question}"
+)
 
-  print(f"Assistant response: {response}")  # Debugging line
-  return jsonify({"response": response})
+llm = ChatOllama(
+    base_url='http://192.168.1.80:11434',
+    model='qwen2.5:14b'
+)
 
-# Run server
-if __name__ == '__main__':
-  app.run(host='0.0.0.0', port=8080)
+def format_docs(docs):
+    return "\n\n".join(doc.page_content for doc in docs)
+
+# for file in os.listdir(data_dir):
+#     loader = PyPDFLoader(f"""{data_dir}/{file}""")
+#     for f in loader.load():
+#         files.append(f)
+
+# text_splitter = RecursiveCharacterTextSplitter(
+#     chunk_size=300,
+#     chunk_overlap=30
+# )
+
+# documents = text_splitter.split_documents(files)
+
+embeddings = OllamaEmbeddings(
+    base_url='http://192.168.1.80:11434',
+    model="nomic-embed-text"
+)
+
+vectorstore = Chroma(
+    collection_name="ollama",
+    embedding_function=embeddings,
+    persist_directory="./chroma_db"
+)
+
+documents = [
+    Document(
+        page_content=f"{session}",
+        metadata=session
+    )
+    for session in sessions
+]
+
+uuids = [str(uuid4()) for _ in range(len(sessions))]
+
+vectorstore.add_documents(documents=documents, ids=uuids)
+
+query = 'Какие 3 фильма можно посмотреть сегодня?'
+
+qa_chain = (
+    {
+        "instructions": RunnableLambda(lambda _: instructions),
+        "context": vectorstore.as_retriever() | format_docs,
+        "question": RunnablePassthrough(),
+    }
+    | prompt
+    | llm
+    | StrOutputParser()
+)
+
+response = qa_chain.invoke(query)
+
+print(response)
